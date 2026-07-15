@@ -25,6 +25,14 @@ if __name__ == '__main__':
     parser.add_argument('--multi_grad_step', default=1, help='Number of graident steps to take per environment step, aka UTD', type=int)
     parser.add_argument('--resize_image', default=-1, help='the size of image if need resizing', type=int)
     parser.add_argument('--query_freq', default=-1, help='query frequency', type=int)
+    # --- Multitask Libero + language conditioning ---
+    parser.add_argument('--task_suite', default='libero_paper', help='Libero benchmark suite to train on (multitask).')
+    parser.add_argument('--task_ids', default='', help='Comma-separated Libero task ids to use. Empty = all tasks in the suite.')
+    parser.add_argument('--use_language', default=1, help='Condition the critic/actor on a per-task language embedding.', type=int)
+    parser.add_argument('--use_muse', default=1, help='Use 512-d MUSE embeddings of the task description (else one-hot task ids).', type=int)
+    parser.add_argument('--language_dim', default=512, help='Language embedding dim (512 for MUSE; must be >= num tasks for one-hot).', type=int)
+    parser.add_argument('--use_policy_reps', default=1, help='Condition the critic/actor on the base pi0 model features (policy representation).', type=int)
+    parser.add_argument('--critic_rep', default='psi', help="Which base pi0 representation to read: 'psi' (state-only prefix mean).", type=str)
     
     train_args_dict = dict(
         actor_lr=1e-4,
