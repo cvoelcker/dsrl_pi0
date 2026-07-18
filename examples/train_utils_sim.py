@@ -68,6 +68,53 @@ def _psi_fn(agent_dp):
     return _PSI_FN_CACHE[key]
 
 
+def _batched_pi0_observation(agent_dp, obs_pi_list):
+    """Stack ``len(obs_pi_list)`` raw pi0 inputs into one batched Observation.
+
+    Returns ``(observation, stacked_state_np)``. Input transforms are run per
+    slot (they may not be batch-safe) before stacking.
+    """
+    from openpi.models import model as _model
+    per_slot_inputs = [agent_dp._input_transform(jax.tree.map(lambda x: x, obs))
+                       for obs in obs_pi_list]
+    stacked = jax.tree.map(
+        lambda *xs: jnp.stack([jnp.asarray(x) for x in xs], axis=0),
+        *per_slot_inputs,
+    )
+    return _model.Observation.from_dict(stacked), np.asarray(stacked["state"])
+
+
+def batched_policy_reps(agent_dp, obs_pi_list):
+    """Batched psi (state-only prefix mean) across slots. Returns list of
+    (psi_dim,) float32 arrays, one per slot."""
+    observation, _ = _batched_pi0_observation(agent_dp, obs_pi_list)
+    psi_out = _psi_fn(agent_dp)(observation)
+    psi_batched = np.asarray(psi_out[0] if isinstance(psi_out, tuple) else psi_out)
+    return [np.asarray(psi_batched[b], dtype=np.float32)
+            for b in range(psi_batched.shape[0])]
+
+
+def batched_pi0_sample(agent_dp, obs_pi_list, noise_batch, rng_key):
+    """Batched pi0 diffusion. ``noise_batch``: (B, 50, action_dim). Returns
+    a list of B numpy action arrays with `_output_transform` applied per slot.
+
+    Batch dim is always ``len(obs_pi_list)`` — pass a padded list so the jitted
+    ``sample_actions`` doesn't recompile when slots finish mid-episode.
+    """
+    observation, stacked_state = _batched_pi0_observation(agent_dp, obs_pi_list)
+    actions_batched = np.asarray(
+        agent_dp._sample_actions(rng_key, observation, noise=jnp.asarray(noise_batch))
+    )  # (B, H, A)
+    actions_out = []
+    for b in range(actions_batched.shape[0]):
+        out = agent_dp._output_transform({
+            "state": stacked_state[b],
+            "actions": actions_batched[b],
+        })
+        actions_out.append(out["actions"])
+    return actions_out
+
+
 def get_policy_reps(agent_dp, obs_pi_zero):
     '''
     Read the base pi0 model's psi representation (state-only prefix mean) for a
@@ -142,10 +189,12 @@ def trajwise_alternating_training_loop(variant, agent, env, eval_env, online_rep
     if shard_fn is not None:
         replay_buffer_iterator = map(shard_fn, replay_buffer_iterator)
 
-    # In the single-task / non-libero case, wrap the passed env in a one-entry
-    # task registry so collection/eval share a single code path.
+    # Libero uses the subprocess-vectorized env (env == vec_env, no per-task envs);
+    # other envs (aloha) keep the single-env task registry.
+    use_vec = 'libero' in variant.env
     if tasks is None:
         tasks = [{'env': env, 'description': variant.get('task_description'), 'language_emb': None}]
+    tasks_by_id = {t['task_id']: t for t in tasks if 'task_id' in t} if use_vec else None
 
     total_env_steps = 0
     traj_idx = 0
@@ -153,24 +202,35 @@ def trajwise_alternating_training_loop(variant, agent, env, eval_env, online_rep
     wandb_logger.log({'num_online_samples': 0}, step=i)
     wandb_logger.log({'num_online_trajs': 0}, step=i)
     wandb_logger.log({'env_steps': 0}, step=i)
-    
+
     with tqdm(total=variant.max_steps, initial=0) as pbar:
         while i <= variant.max_steps:
-            # Round-robin over tasks so the multitask critic sees every task evenly.
-            task = tasks[traj_idx % len(tasks)]
-            traj_idx += 1
-            traj = collect_traj(variant, agent, task, i, agent_dp)
-            traj_id = online_replay_buffer._traj_counter
-            add_online_data_to_buffer(variant, traj, online_replay_buffer)
-            total_env_steps += traj['env_steps']
+            if use_vec:
+                # One batched rollout across `num_envs` slots; task rotation is
+                # handled inside the vec env's _next_tasks.
+                trajs = collect_traj_vec(variant, agent, env, tasks_by_id, i, agent_dp)
+            else:
+                # Round-robin over tasks so the multitask critic sees every task evenly.
+                task = tasks[traj_idx % len(tasks)]
+                traj_idx += 1
+                trajs = [collect_traj(variant, agent, task, i, agent_dp)]
+
+            add_online_data_to_buffer(variant, trajs, online_replay_buffer)
+            batch_env_steps = sum(tr['env_steps'] for tr in trajs)
+            total_env_steps += batch_env_steps
+            batch_query_steps = sum(len(tr['rewards']) for tr in trajs)
             print('online buffer timesteps length:', len(online_replay_buffer))
-            print('online buffer num traj:', traj_id + 1)
+            print('online buffer num traj:', online_replay_buffer._traj_counter)
             print('total env steps:', total_env_steps)
-            
+
+            # Aggregate logging values across the batch (means for vec, identity for single).
+            batch_return = float(np.mean([tr['episode_return'] for tr in trajs]))
+            batch_success = float(np.mean([float(tr['is_success']) for tr in trajs]))
+
             if variant.get("num_online_gradsteps_batch", -1) > 0:
                 num_gradsteps = variant.num_online_gradsteps_batch
             else:
-                num_gradsteps = len(traj["rewards"])*variant.multi_grad_step
+                num_gradsteps = batch_query_steps * variant.multi_grad_step
 
             if len(online_replay_buffer) > variant.start_online_updates:
                 for _ in range(num_gradsteps):
@@ -178,7 +238,7 @@ def trajwise_alternating_training_loop(variant, agent, env, eval_env, online_rep
                     if i == 0:
                         print('performing evaluation for initial checkpoint')
                         if perform_control_evals:
-                            perform_control_eval(agent, tasks, i, variant, wandb_logger, agent_dp)
+                            perform_control_eval(agent, tasks, i, variant, wandb_logger, agent_dp, eval_env=eval_env)
                         if hasattr(agent, 'perform_eval'):
                             agent.perform_eval(variant, i, wandb_logger, replay_buffer, replay_buffer_iterator, eval_env)
 
@@ -188,7 +248,7 @@ def trajwise_alternating_training_loop(variant, agent, env, eval_env, online_rep
 
                     pbar.update()
                     i += 1
-                        
+
 
                     if i % variant.log_interval == 0:
                         update_info = {k: jax.device_get(v) for k, v in update_info.items()}
@@ -197,19 +257,18 @@ def trajwise_alternating_training_loop(variant, agent, env, eval_env, online_rep
                                 wandb_logger.log({f'training/{k}': v}, step=i)
                             elif v.ndim <= 2:
                                 wandb_logger.log_histogram(f'training/{k}', v, i)
-                        # wandb_logger.log({'replay_buffer_size': len(online_replay_buffer)}, i)
                         wandb_logger.log({
                             'replay_buffer_size': len(online_replay_buffer),
-                            'episode_return (exploration)': traj['episode_return'],
-                            'is_success (exploration)': int(traj['is_success']),
+                            'episode_return (exploration)': batch_return,
+                            'is_success (exploration)': batch_success,
                         }, i)
 
                     if i % variant.eval_interval == 0:
                         wandb_logger.log({'num_online_samples': len(online_replay_buffer)}, step=i)
-                        wandb_logger.log({'num_online_trajs': traj_id + 1}, step=i)
+                        wandb_logger.log({'num_online_trajs': online_replay_buffer._traj_counter}, step=i)
                         wandb_logger.log({'env_steps': total_env_steps}, step=i)
                         if perform_control_evals:
-                            perform_control_eval(agent, tasks, i, variant, wandb_logger, agent_dp)
+                            perform_control_eval(agent, tasks, i, variant, wandb_logger, agent_dp, eval_env=eval_env)
                         if hasattr(agent, 'perform_eval'):
                             agent.perform_eval(variant, i, wandb_logger, replay_buffer, replay_buffer_iterator, eval_env)
 
@@ -217,8 +276,15 @@ def trajwise_alternating_training_loop(variant, agent, env, eval_env, online_rep
                         agent.save_checkpoint(variant.outputdir, i, variant.checkpoint_interval)
 
             
-def add_online_data_to_buffer(variant, traj, online_replay_buffer):
+def add_online_data_to_buffer(variant, traj_or_trajs, online_replay_buffer):
+    """Insert one trajectory or a list of trajectories (from the vec-env) into
+    the buffer, incrementing the traj counter once per trajectory."""
+    trajs = traj_or_trajs if isinstance(traj_or_trajs, list) else [traj_or_trajs]
+    for traj in trajs:
+        _insert_single_traj(variant, traj, online_replay_buffer)
 
+
+def _insert_single_traj(variant, traj, online_replay_buffer):
     discount_horizon = variant.query_freq
     actions = np.array(traj['actions']) # (T, chunk_size, action_dim )
     episode_len = len(actions)
@@ -234,7 +300,7 @@ def add_online_data_to_buffer(variant, traj, online_replay_buffer):
         if not variant.add_states:
             obs.pop('state', None)
             next_obs.pop('state', None)
-        
+
         insert_dict = dict(
             observations=obs,
             next_observations=next_obs,
@@ -351,7 +417,170 @@ def collect_traj(variant, agent, task, i, agent_dp=None):
         'env_steps': t + 1 
     }
 
-def perform_control_eval(agent, tasks, i, variant, wandb_logger, agent_dp=None):
+def collect_traj_vec(variant, agent, vec_env, tasks_by_id, i, agent_dp, task_ids=None, rng=None):
+    """Batched exploration rollout across `vec_env.num_envs` slots.
+
+    Returns a list of per-slot trajectory dicts with the same schema as
+    `collect_traj` (adds a 'task_id' field). Slots whose episode ended before
+    any pi0 query are dropped.
+    """
+    query_frequency = variant.query_freq
+    max_timesteps = variant.max_timesteps
+    env_max_reward = variant.env_max_reward
+    N = vec_env.num_envs
+
+    if rng is None:
+        agent._rng, rng = jax.random.split(agent._rng)
+
+    initial_obs = vec_env.reset_all(task_ids=task_ids)
+    slot_task_ids = list(vec_env.env_task_ids)
+
+    slot_obs_dicts = [[] for _ in range(N)]
+    slot_actions = [[] for _ in range(N)]
+    slot_rewards = [[] for _ in range(N)]
+    slot_images = [[] for _ in range(N)]
+    slot_done = [False] * N
+    slot_last_reward = [0.0] * N
+    slot_last_obs = list(initial_obs)
+    slot_action_chunk = [None] * N
+
+    want_policy_reps = bool(variant.get('use_policy_reps', False))
+    # Padded to constant batch = N so pi0's jitted sample_actions doesn't
+    # recompile when slots finish mid-episode; padded (done) slots' outputs
+    # are discarded.
+    action_dim = agent.action_chunk_shape[-1]
+
+    for t in tqdm(range(max_timesteps)):
+        if t % query_frequency == 0:
+            # 1) Build pi0 inputs for every slot (padded slots use their stale
+            #    last obs so the batch dim stays fixed at N).
+            obs_pi_batch = [
+                obs_to_pi_zero_input(slot_last_obs[s], variant,
+                                     tasks_by_id[slot_task_ids[s]].get('description'))
+                for s in range(N)
+            ]
+
+            # 2) Batched psi so the SAC actor sees the real policy_reps below.
+            psi_per_slot = (batched_policy_reps(agent_dp, obs_pi_batch)
+                            if want_policy_reps else [None] * N)
+
+            # 3) Per-slot SAC actor → noise (cheap; keeps sac_obs shape stable
+            #    while pi0 does the heavy diffusion).
+            per_slot_meta = [None] * N  # (obs_dict, actions_noise)
+            noise_batch_np = np.zeros((N, 50, action_dim), dtype=np.float32)
+            for slot in range(N):
+                if slot_done[slot]:
+                    continue
+                obs = slot_last_obs[slot]
+                curr_image = obs_to_img(obs, variant)
+                qpos = obs_to_qpos(obs, variant)
+                language_emb = tasks_by_id[slot_task_ids[slot]].get('language_emb')
+                obs_dict = build_obs_dict(curr_image, qpos, variant, language_emb, psi_per_slot[slot])
+
+                rng, key = jax.random.split(rng)
+                if i == 0:
+                    noise = jax.random.normal(key, (1, *agent.action_chunk_shape))
+                    noise_repeat = jax.numpy.repeat(noise[:, -1:, :], 50 - noise.shape[1], axis=1)
+                    noise = jax.numpy.concatenate([noise, noise_repeat], axis=1)  # (1, 50, A)
+                    actions_noise = np.asarray(noise[0, :agent.action_chunk_shape[0], :])
+                    noise_np = np.asarray(noise[0])  # (50, A)
+                else:
+                    actions_noise = agent.sample_actions(obs_dict)
+                    actions_noise = np.reshape(actions_noise, agent.action_chunk_shape)
+                    tail = np.repeat(actions_noise[-1:, :], 50 - actions_noise.shape[0], axis=0)
+                    noise_np = np.concatenate([actions_noise, tail], axis=0)  # (50, A)
+                noise_batch_np[slot] = noise_np
+                per_slot_meta[slot] = (obs_dict, actions_noise)
+
+            # 4) One batched pi0 diffusion across all N slots.
+            rng, sample_key = jax.random.split(rng)
+            actions_out = batched_pi0_sample(agent_dp, obs_pi_batch, noise_batch_np, sample_key)
+
+            # 5) Commit to active slots; padded (done) slots discarded.
+            for slot in range(N):
+                if slot_done[slot]:
+                    continue
+                obs_dict, actions_noise = per_slot_meta[slot]
+                slot_action_chunk[slot] = actions_out[slot]
+                slot_actions[slot].append(actions_noise)
+                slot_obs_dicts[slot].append(obs_dict)
+
+        # Record images at each timestep for slots still running.
+        for slot in range(N):
+            if not slot_done[slot]:
+                slot_images[slot].append(obs_to_img(slot_last_obs[slot], variant))
+
+        actions_to_send = {}
+        for slot in range(N):
+            if slot_done[slot]:
+                continue
+            actions_to_send[slot] = slot_action_chunk[slot][t % query_frequency]
+
+        if not actions_to_send:
+            break
+
+        results = vec_env.step_all(actions_to_send)
+        for slot, (obs, reward, done, _) in results.items():
+            slot_last_obs[slot] = obs
+            slot_rewards[slot].append(reward)
+            slot_last_reward[slot] = reward
+            if done:
+                slot_done[slot] = True
+
+        if all(slot_done):
+            break
+
+    # Final observation per slot (mirrors single-env append after the loop).
+    # Batched psi so the closing obs matches the query-step conditioning path.
+    final_obs_pi_batch = [
+        obs_to_pi_zero_input(slot_last_obs[s], variant,
+                             tasks_by_id[slot_task_ids[s]].get('description'))
+        for s in range(N)
+    ] if want_policy_reps else None
+    final_psi = (batched_policy_reps(agent_dp, final_obs_pi_batch)
+                 if want_policy_reps else [None] * N)
+    for slot in range(N):
+        obs = slot_last_obs[slot]
+        curr_image = obs_to_img(obs, variant)
+        qpos = obs_to_qpos(obs, variant)
+        language_emb = tasks_by_id[slot_task_ids[slot]].get('language_emb')
+        obs_dict = build_obs_dict(curr_image, qpos, variant, language_emb, final_psi[slot])
+        slot_obs_dicts[slot].append(obs_dict)
+        slot_images[slot].append(curr_image)
+
+    trajs = []
+    for slot in range(N):
+        query_steps = len(slot_actions[slot])
+        if query_steps == 0:
+            continue
+        env_rewards = np.array(slot_rewards[slot], dtype=np.float32)
+        episode_return = float(np.sum(env_rewards))
+        is_success = bool(slot_last_reward[slot] == env_max_reward)
+        if is_success:
+            r = np.concatenate([-np.ones(query_steps - 1), [0]])
+            m = np.concatenate([np.ones(query_steps - 1), [0]])
+        else:
+            r = -np.ones(query_steps)
+            m = np.ones(query_steps)
+        trajs.append({
+            'observations': slot_obs_dicts[slot],
+            'actions': slot_actions[slot],
+            'rewards': r,
+            'masks': m,
+            'env_rewards': env_rewards,
+            'is_success': is_success,
+            'episode_return': episode_return,
+            'images': slot_images[slot],
+            'env_steps': len(env_rewards),
+            'task_id': slot_task_ids[slot],
+        })
+    return trajs
+
+
+def perform_control_eval(agent, tasks, i, variant, wandb_logger, agent_dp=None, eval_env=None):
+    if 'libero' in variant.env and eval_env is not None:
+        return _perform_control_eval_vec(agent, tasks, i, variant, wandb_logger, agent_dp, eval_env)
+
     query_frequency = variant.query_freq
     print('query frequency', query_frequency)
     max_timesteps = variant.max_timesteps
@@ -457,6 +686,65 @@ def perform_control_eval(agent, tasks, i, variant, wandb_logger, agent_dp=None):
         summary_str += f'Reward >= {r}: {more_or_equal_r}/{num_rollouts} = {more_or_equal_r_rate*100}%\n'
 
     print(summary_str)
+
+def _perform_control_eval_vec(agent, tasks, i, variant, wandb_logger, agent_dp, vec_env):
+    """Vec-env eval: for each task, pin all slots to that task and run enough
+    batches to gather `variant.eval_episodes` rollouts. Trims overshoot from
+    the last batch so per-task episode counts match the single-env path."""
+    env_max_reward = variant.env_max_reward
+    tasks_by_id = {t['task_id']: t for t in tasks if 'task_id' in t}
+    N = vec_env.num_envs
+
+    vec_env.reseed_perturbations(seed=variant.seed + 456)
+    rng = jax.random.PRNGKey(variant.seed + 456)
+
+    episode_returns, highest_rewards, success_rates, episode_lens = [], [], [], []
+
+    for task in tasks:
+        tid = task['task_id']
+        task_description = task.get('description')
+        task_successes = []
+        rollout_id = 0
+        while len(task_successes) < variant.eval_episodes:
+            rng, sub = jax.random.split(rng)
+            batch = collect_traj_vec(
+                variant, agent, vec_env, tasks_by_id, i, agent_dp,
+                task_ids=[tid] * N, rng=sub,
+            )
+            for tr in batch:
+                if len(task_successes) >= variant.eval_episodes:
+                    break
+                env_rewards = tr['env_rewards']
+                episode_returns.append(float(np.sum(env_rewards)))
+                highest_rewards.append(float(np.max(env_rewards)) if len(env_rewards) else 0.0)
+                success_rates.append(bool(tr['is_success']))
+                task_successes.append(bool(tr['is_success']))
+                episode_lens.append(tr['env_steps'])
+                print(f'Rollout task{tid}_{rollout_id} ({task_description}): '
+                      f'episode_return={episode_returns[-1]}, Success: {tr["is_success"]}')
+                video = np.stack(tr['images']).transpose(0, 3, 1, 2)
+                wandb_logger.log({f'eval_video/task{tid}_{rollout_id}': wandb.Video(video, fps=50)}, step=i)
+                rollout_id += 1
+
+        if len(tasks) > 1:
+            wandb_logger.log(
+                {f'evaluation/success_rate_task{tid}': float(np.mean(task_successes))}, step=i)
+
+    num_rollouts = len(success_rates)
+    success_rate = float(np.mean(success_rates))
+    avg_return = float(np.mean(episode_returns))
+    avg_episode_len = float(np.mean(episode_lens))
+    summary = f'\nSuccess rate: {success_rate}\nAverage return: {avg_return}\n\n'
+    wandb_logger.log({'evaluation/avg_return': avg_return}, step=i)
+    wandb_logger.log({'evaluation/success_rate': success_rate}, step=i)
+    wandb_logger.log({'evaluation/avg_episode_len': avg_episode_len}, step=i)
+    for r in range(env_max_reward + 1):
+        more_or_equal_r = int((np.array(highest_rewards) >= r).sum())
+        rate = more_or_equal_r / num_rollouts
+        wandb_logger.log({f'evaluation/Reward >= {r}': rate}, step=i)
+        summary += f'Reward >= {r}: {more_or_equal_r}/{num_rollouts} = {rate * 100}%\n'
+    print(summary)
+
 
 def make_multiple_value_reward_visulizations(agent, variant, i, replay_buffer, wandb_logger):
     trajs = replay_buffer.get_random_trajs(3)

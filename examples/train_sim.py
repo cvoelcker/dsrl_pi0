@@ -5,7 +5,7 @@ xla_flags = os.environ.get('XLA_FLAGS', '')
 xla_flags += ' --xla_gpu_triton_gemm_any=True'
 os.environ['XLA_FLAGS'] = xla_flags
 
-import pathlib, copy
+import copy
 
 import jax
 from jaxrl2.agents.pixel_sac.pixel_sac_learner import PixelSACLearner
@@ -17,14 +17,13 @@ import gym_aloha
 from gym.spaces import Dict, Box
 
 from libero.libero import benchmark
-from libero.libero import get_libero_path
-from libero.libero.envs import OffScreenRenderEnv
 
 from jaxrl2.data import ReplayBuffer
 from jaxrl2.utils.wandb_logger import WandBLogger, create_exp_name
 import tempfile
 from functools import partial
 from examples.train_utils_sim import trajwise_alternating_training_loop
+from examples.env_adapter import make_libero_vec_env
 import tensorflow as tf
 from jax.experimental.compilation_cache import compilation_cache
 
@@ -34,15 +33,6 @@ from openpi.shared import download
 
 home_dir = os.environ['HOME']
 compilation_cache.initialize_cache(os.path.join(home_dir, 'jax_compilation_cache'))
-
-def _get_libero_env(task, resolution, seed):
-    """Initializes and returns the LIBERO environment, along with the task description."""
-    task_description = task.language
-    task_bddl_file = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
-    env_args = {"bddl_file_name": task_bddl_file, "camera_heights": resolution, "camera_widths": resolution}
-    env = OffScreenRenderEnv(**env_args)
-    env.seed(seed)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
-    return env, task_description
 
 def shard_batch(batch, sharding):
     """Shards a batch across devices along its first dimension.
@@ -129,13 +119,13 @@ def main(variant):
             task_ids = list(range(num_suite_tasks))
         print(f'Libero suite {variant.task_suite}: {num_suite_tasks} tasks, training on {task_ids}')
 
-        # Build one env per task; each carries its own language-conditioning prompt.
+        # Task metadata only; the actual envs live inside the subprocess-vectorized
+        # worker pool built below. We no longer construct per-task in-process envs.
         tasks = []
         for tid in task_ids:
             task = task_suite.get_task(tid)
-            task_env, task_description = _get_libero_env(task, 256, variant.seed)
-            tasks.append({'task_id': tid, 'description': task_description, 'env': task_env})
-            print(f'  task {tid}: {task_description}')
+            tasks.append({'task_id': tid, 'description': task.language})
+            print(f'  task {tid}: {task.language}')
 
         # Per-task language embeddings for critic/actor conditioning.
         variant.use_language = bool(variant.get('use_language', 0))
@@ -159,9 +149,11 @@ def main(variant):
         else:
             variant.language_dim = 0
 
-        # First task drives the initial pi0 prompt / backward-compatible fields.
-        env = tasks[0]['env']
-        eval_env = env
+        # Subprocess-vectorized Libero envs replace the per-task in-process envs;
+        # `env`/`eval_env` are the same vec-env instance (rollout + eval share workers).
+        vec_env = make_libero_vec_env(variant)
+        env = vec_env
+        eval_env = vec_env
         variant.task_description = tasks[0]['description']
         variant.env_max_reward = 1
         variant.max_timesteps = 400
