@@ -27,9 +27,10 @@ tensorflow-text==2.19.0
 etils==1.12.2
 matplotlib==3.9.3
 wandb[media]==0.19.9
+mujoco==3.2.0
 opencv-python==4.11.0.86
 robosuite==1.4.1
-gym-aloha==0.1.1
+# gym-aloha==0.1.1
 bddl==3.5.0
 tf_keras==2.19.0
 moviepy==1.0.3

@@ -13,7 +13,6 @@ from jaxrl2.utils.general_utils import add_batch_dim
 import numpy as np
 
 import gymnasium as gym
-import gym_aloha
 from gym.spaces import Dict, Box
 
 from libero.libero import benchmark
@@ -206,10 +205,10 @@ def main(variant):
     # Load the base pi0 policy first so we can size the policy-feature obs key.
     if variant.env == 'libero':
         config = openpi_config.get_config("pi0_libero")
-        checkpoint_dir = download.maybe_download("s3://openpi-assets/checkpoints/pi0_libero")
+        checkpoint_dir = download.maybe_download("gs://openpi-assets/checkpoints/pi0_libero")
     elif variant.env == 'aloha_cube':
         config = openpi_config.get_config("pi0_aloha_sim")
-        checkpoint_dir = download.maybe_download("s3://openpi-assets/checkpoints/pi0_aloha_sim")
+        checkpoint_dir = download.maybe_download("gs://openpi-assets/checkpoints/pi0_aloha_sim")
     else:
         raise NotImplementedError()
     agent_dp = policy_config.create_trained_policy(config, checkpoint_dir)
@@ -265,4 +264,3 @@ def main(variant):
         start_step=start_step, start_total_env_steps=start_total_env_steps,
         start_traj_idx=start_traj_idx,
     )
- 

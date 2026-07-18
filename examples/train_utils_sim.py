@@ -64,7 +64,7 @@ def _psi_fn(agent_dp):
     key = id(agent_dp)
     if key not in _PSI_FN_CACHE:
         from openpi.shared import nnx_utils
-        _PSI_FN_CACHE[key] = nnx_utils.module_jit(agent_dp._model.get_psi_representation)
+        _PSI_FN_CACHE[key] = nnx_utils.module_jit(agent_dp._model.get_state_representations)
     return _PSI_FN_CACHE[key]
 
 
