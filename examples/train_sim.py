@@ -214,7 +214,11 @@ def main(variant):
 
     agent = PixelSACLearner(variant.seed, sample_obs, sample_action, **kwargs)
 
-    online_buffer_size = variant.max_steps  // variant.multi_grad_step
+    # Hard cap at 1M transitions — the buffer is now a fixed FIFO ring (see
+    # ReplayBuffer.insert), so pick the smaller of the naive "one insert per
+    # multi_grad_step" estimate and the cap. This bounds host memory to
+    # ~1M × per-transition bytes regardless of max_steps or num_envs.
+    online_buffer_size = min(variant.max_steps // variant.multi_grad_step, 1_000_000)
     online_replay_buffer = ReplayBuffer(dummy_env.observation_space, dummy_env.action_space, int(online_buffer_size))
     replay_buffer = online_replay_buffer
     replay_buffer.seed(variant.seed)

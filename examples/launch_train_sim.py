@@ -1,3 +1,10 @@
+import os
+# Stop JAX from preallocating ~90% of VRAM at first CUDA touch, so the N
+# SubprocVectorizedLiberoEnv workers' EGL/MuJoCo rendering contexts (and
+# cuSolver's handle) still have headroom on the same GPU. Must be set BEFORE
+# anything imports jax.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
 import argparse
 import sys
 from examples.train_sim import main

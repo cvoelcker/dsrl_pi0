@@ -55,6 +55,8 @@ class ReplayBuffer(Dataset):
         self.size = 0
         self._traj_counter = 0
         self._start = 0
+        self._write_ptr = 0        # next slot to overwrite once size == capacity (FIFO)
+        self._wrapped = False       # True after the ring has wrapped at least once
         self.traj_bounds = dict()
         self.streaming_buffer_size = None # this is for streaming the online data
 
@@ -65,8 +67,15 @@ class ReplayBuffer(Dataset):
         return self.size
 
     def increment_traj_counter(self):
-        self.traj_bounds[self._traj_counter] = (self._start, self.size) # [start, end)
-        self._start = self.size
+        # traj_bounds tracks [start, end) index ranges for full-trajectory
+        # samplers like get_random_trajs / value-reward visualizations. Once
+        # the FIFO ring wraps, these ranges no longer describe contiguous
+        # in-buffer regions, so we stop recording them and any traj-based
+        # sampler must be guarded (or restricted to _traj_counter values from
+        # before the wrap). SAC's transition-level sampler is unaffected.
+        if not self._wrapped:
+            self.traj_bounds[self._traj_counter] = (self._start, self._write_ptr)
+            self._start = self._write_ptr
         self._traj_counter += 1
 
     def get_random_trajs(self, num_trajs: int):
@@ -113,45 +122,30 @@ class ReplayBuffer(Dataset):
         return batch
         
     def insert(self, data_dict: DatasetDict):
-        if self.size == self.capacity:
-            # Double the capacity
-            observations = _init_replay_dict(self.observation_space, self.capacity)
-            next_observations = _init_replay_dict(self.observation_space, self.capacity)
-            actions = np.empty((self.capacity, *self.action_space.shape), dtype=self.action_space.dtype)
-            next_actions = np.empty((self.capacity, *self.action_space.shape), dtype=self.action_space.dtype)
-            rewards = np.empty((self.capacity, ), dtype=np.float32)
-            masks = np.empty((self.capacity, ), dtype=np.float32)
-            discount = np.empty((self.capacity, ), dtype=np.float32)
+        """FIFO insert into a fixed-capacity buffer.
 
-            data_new = {
-                'observations': observations,
-                'next_observations': next_observations,
-                'actions': actions,
-                'next_actions': next_actions,
-                'rewards': rewards,
-                'masks': masks,
-                'discount': discount,
-            }
-
-            for x in data_new:
-                if isinstance(self.data[x], np.ndarray):
-                    self.data[x] = np.concatenate((self.data[x], data_new[x]), axis=0)
-                elif isinstance(self.data[x], dict):
-                    for y in self.data[x]:
-                        self.data[x][y] = np.concatenate((self.data[x][y], data_new[x][y]), axis=0)
-                else:
-                    raise TypeError()
-            self.capacity *= 2
-
-
+        Each ``data_dict`` is a self-contained transition — obs, next_obs,
+        action, next_action, reward, mask, discount all land at the same index
+        ``_write_ptr``. Because every stored index carries its own (obs,
+        next_obs) pair, sampling any index gives a valid transition even after
+        the ring wraps: two neighbouring indices may belong to different
+        episodes, but the pairing *within* an index is never split. SAC samples
+        individual transitions (``sample`` uses ``randint(0, self.size)``), so
+        no boundary special-casing is needed.
+        """
+        idx = self._write_ptr
         for x in data_dict:
             if x in self.data:
                 if isinstance(data_dict[x], dict):
                     for y in data_dict[x]:
-                        self.data[x][y][self.size] = data_dict[x][y]
-                else:                        
-                    self.data[x][self.size] = data_dict[x]
-        self.size += 1
+                        self.data[x][y][idx] = data_dict[x][y]
+                else:
+                    self.data[x][idx] = data_dict[x]
+        self._write_ptr = (self._write_ptr + 1) % self.capacity
+        if self._write_ptr == 0:
+            self._wrapped = True
+        if self.size < self.capacity:
+            self.size += 1
     
     def compute_action_stats(self):
         actions = self.data['actions']
