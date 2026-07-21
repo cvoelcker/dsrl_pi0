@@ -184,7 +184,9 @@ def obs_to_qpos(obs, variant):
     return qpos
 
 def trajwise_alternating_training_loop(variant, agent, env, eval_env, online_replay_buffer, replay_buffer, wandb_logger,
-                                       perform_control_evals=True, shard_fn=None, agent_dp=None, tasks=None):
+                                       perform_control_evals=True, shard_fn=None, agent_dp=None, tasks=None,
+                                       start_step=0, start_total_env_steps=0, start_traj_idx=0):
+    from examples.checkpoint_utils import save_run_checkpoint
     replay_buffer_iterator = replay_buffer.get_iterator(variant.batch_size)
     if shard_fn is not None:
         replay_buffer_iterator = map(shard_fn, replay_buffer_iterator)
@@ -196,14 +198,15 @@ def trajwise_alternating_training_loop(variant, agent, env, eval_env, online_rep
         tasks = [{'env': env, 'description': variant.get('task_description'), 'language_emb': None}]
     tasks_by_id = {t['task_id']: t for t in tasks if 'task_id' in t} if use_vec else None
 
-    total_env_steps = 0
-    traj_idx = 0
-    i = 0
-    wandb_logger.log({'num_online_samples': 0}, step=i)
-    wandb_logger.log({'num_online_trajs': 0}, step=i)
-    wandb_logger.log({'env_steps': 0}, step=i)
+    total_env_steps = start_total_env_steps
+    traj_idx = start_traj_idx
+    i = start_step
+    if i == 0:
+        wandb_logger.log({'num_online_samples': 0}, step=i)
+        wandb_logger.log({'num_online_trajs': 0}, step=i)
+        wandb_logger.log({'env_steps': 0}, step=i)
 
-    with tqdm(total=variant.max_steps, initial=0) as pbar:
+    with tqdm(total=variant.max_steps, initial=i) as pbar:
         while i <= variant.max_steps:
             if use_vec:
                 # One batched rollout across `num_envs` slots; task rotation is
@@ -273,7 +276,13 @@ def trajwise_alternating_training_loop(variant, agent, env, eval_env, online_rep
                             agent.perform_eval(variant, i, wandb_logger, replay_buffer, replay_buffer_iterator, eval_env)
 
                     if variant.checkpoint_interval != -1 and i % variant.checkpoint_interval == 0:
-                        agent.save_checkpoint(variant.outputdir, i, variant.checkpoint_interval)
+                        save_run_checkpoint(
+                            variant.ckpt_dir, agent, online_replay_buffer,
+                            step=i, total_env_steps=total_env_steps,
+                            traj_idx=traj_idx,
+                            wandb_run_id=variant.get('run_id', '') or None,
+                            wandb_group=variant.get('wandb_group', ''),
+                        )
 
             
 def add_online_data_to_buffer(variant, traj_or_trajs, online_replay_buffer):

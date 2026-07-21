@@ -21,6 +21,7 @@ if __name__ == '__main__':
     parser.add_argument('--log_interval', default=1000, help='Logging interval.', type=int)
     parser.add_argument('--eval_interval', default=5000, help='Eval interval.', type=int)
     parser.add_argument('--checkpoint_interval', default=-1, help='checkpoint interval.', type=int)
+    parser.add_argument('--run_id', default='', help='Unique run id. Checkpoints live under $EXP/<run_id>; if that folder exists, the run resumes (agent + replay buffer + wandb run) instead of starting fresh. Empty => no checkpointing.', type=str)
     parser.add_argument('--batch_size', default=16, help='Mini batch size.', type=int)
     parser.add_argument('--max_steps', default=int(1e6), help='Number of training steps.', type=int)
     parser.add_argument('--add_states', default=1, help='whether to add low-dim states to the obervations', type=int)

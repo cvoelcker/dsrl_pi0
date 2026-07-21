@@ -80,7 +80,7 @@ def create_stats_ordered_dict(
     return stats
 
 class WandBLogger(object):
-    def __init__(self, wandb_logging, variant, project, experiment_id,  output_dir=None, group_name='', team=None):
+    def __init__(self, wandb_logging, variant, project, experiment_id,  output_dir=None, group_name='', team=None, resume=False):
         self.wandb_logging = wandb_logging
         output_dir = os.path.join(output_dir, experiment_id)
         os.makedirs(output_dir, exist_ok=True)
@@ -106,7 +106,8 @@ class WandBLogger(object):
                 id=experiment_id,
                 settings=wandb.Settings(start_method="thread"),
                 group=group_name,
-                entity=team
+                entity=team,
+                resume='allow' if resume else None,
             )
             self.output_dir = output_dir
 

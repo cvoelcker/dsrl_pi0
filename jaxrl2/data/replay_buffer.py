@@ -197,20 +197,24 @@ class ReplayBuffer(Dataset):
     def save(self, filename):
         save_dict = dict(
             data=self.data,
-            size = self.size,
-            _traj_counter = self._traj_counter,
+            size=self.size,
+            _traj_counter=self._traj_counter,
             _start=self._start,
-            traj_bounds=self.traj_bounds
+            _write_ptr=self._write_ptr,
+            _wrapped=self._wrapped,
+            traj_bounds=self.traj_bounds,
         )
         with open(filename, 'wb') as f:
             pickle.dump(save_dict, f, protocol=4)
 
 
     def restore(self, filename):
-        save_dict = np.load(filename, allow_pickle=True)[0]
-        # todo test this:
+        with open(filename, 'rb') as f:
+            save_dict = pickle.load(f)
         self.data = save_dict['data']
         self.size = save_dict['size']
         self._traj_counter = save_dict['_traj_counter']
         self._start = save_dict['_start']
+        self._write_ptr = save_dict.get('_write_ptr', self.size % self.capacity)
+        self._wrapped = save_dict.get('_wrapped', self.size >= self.capacity)
         self.traj_bounds = save_dict['traj_bounds']

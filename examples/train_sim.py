@@ -24,6 +24,11 @@ import tempfile
 from functools import partial
 from examples.train_utils_sim import trajwise_alternating_training_loop
 from examples.env_adapter import make_libero_vec_env
+from examples.checkpoint_utils import (
+    checkpoint_exists,
+    load_agent_and_buffer,
+    load_run_state,
+)
 import tensorflow as tf
 from jax.experimental.compilation_cache import compilation_cache
 
@@ -97,12 +102,22 @@ def main(variant):
         expname = create_exp_name(variant.prefix, seed=variant.seed) + f"_{variant.suffix}"
     else:
         expname = create_exp_name(variant.prefix, seed=variant.seed)
-   
-    outputdir = os.path.join(os.environ['EXP'], expname)
+
+    # If run_id is set, use $EXP/<run_id> as both the output/checkpoint dir
+    # and the wandb id — that way resuming picks up the same wandb run.
+    run_id = variant.get('run_id', '') or ''
+    if run_id:
+        outputdir = os.path.join(os.environ['EXP'], run_id)
+        resume_run = os.path.isdir(outputdir) and checkpoint_exists(outputdir)
+        expname = run_id
+    else:
+        outputdir = os.path.join(os.environ['EXP'], expname)
+        resume_run = False
     variant.outputdir = outputdir
+    variant.ckpt_dir = outputdir
     if not os.path.exists(outputdir):
         os.makedirs(outputdir)
-    print('writing to output dir ', outputdir)
+    print('writing to output dir ', outputdir, '(resume=%s)' % resume_run)
     
     tasks = None
     if variant.env == 'libero':
@@ -174,9 +189,19 @@ def main(variant):
         variant.language_dim = 0
         
 
-    group_name = variant.prefix + '_' + variant.launch_group_id
+    # Preserve wandb group across resume by pulling it from the saved state.
+    saved_state = load_run_state(outputdir) if resume_run else None
+    if saved_state is not None and saved_state.get('wandb_group'):
+        group_name = saved_state['wandb_group']
+    else:
+        group_name = variant.prefix + '_' + variant.launch_group_id
+    variant.wandb_group = group_name
     wandb_output_dir = tempfile.mkdtemp()
-    wandb_logger = WandBLogger(variant.prefix != '', variant, variant.wandb_project, experiment_id=expname, output_dir=wandb_output_dir, group_name=group_name)
+    wandb_logger = WandBLogger(
+        variant.prefix != '', variant, variant.wandb_project,
+        experiment_id=expname, output_dir=wandb_output_dir,
+        group_name=group_name, resume=resume_run,
+    )
 
     # Load the base pi0 policy first so we can size the policy-feature obs key.
     if variant.env == 'libero':
@@ -222,5 +247,22 @@ def main(variant):
     online_replay_buffer = ReplayBuffer(dummy_env.observation_space, dummy_env.action_space, int(online_buffer_size))
     replay_buffer = online_replay_buffer
     replay_buffer.seed(variant.seed)
-    trajwise_alternating_training_loop(variant, agent, env, eval_env, online_replay_buffer, replay_buffer, wandb_logger, shard_fn=shard_fn, agent_dp=agent_dp, tasks=tasks)
+
+    start_step = 0
+    start_total_env_steps = 0
+    start_traj_idx = 0
+    if resume_run:
+        load_agent_and_buffer(outputdir, agent, online_replay_buffer)
+        start_step = int(saved_state.get('step', 0))
+        start_total_env_steps = int(saved_state.get('total_env_steps', 0))
+        start_traj_idx = int(saved_state.get('traj_idx', 0))
+        print(f'[checkpoint] resuming at step={start_step}, '
+              f'env_steps={start_total_env_steps}, traj_idx={start_traj_idx}')
+
+    trajwise_alternating_training_loop(
+        variant, agent, env, eval_env, online_replay_buffer, replay_buffer,
+        wandb_logger, shard_fn=shard_fn, agent_dp=agent_dp, tasks=tasks,
+        start_step=start_step, start_total_env_steps=start_total_env_steps,
+        start_traj_idx=start_traj_idx,
+    )
  
