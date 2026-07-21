@@ -674,7 +674,7 @@ def perform_control_eval(agent, tasks, i, variant, wandb_logger, agent_dp=None, 
             tag = f'task{task_id}_' if task_id is not None else ''
             print(f'Rollout {tag}{rollout_id} : {episode_return=}, Success: {is_success}')
             video = np.stack(image_list).transpose(0, 3, 1, 2)
-            wandb_logger.log({f'eval_video/{tag}{rollout_id}': wandb.Video(video, fps=50)}, step=i)
+            # wandb_logger.log({f'eval_video/{tag}{rollout_id}': wandb.Video(video, fps=50)}, step=i)
 
         if task_id is not None and len(tasks) > 1:
             wandb_logger.log(
@@ -731,8 +731,8 @@ def _perform_control_eval_vec(agent, tasks, i, variant, wandb_logger, agent_dp, 
                 episode_lens.append(tr['env_steps'])
                 print(f'Rollout task{tid}_{rollout_id} ({task_description}): '
                       f'episode_return={episode_returns[-1]}, Success: {tr["is_success"]}')
-                video = np.stack(tr['images']).transpose(0, 3, 1, 2)
-                wandb_logger.log({f'eval_video/task{tid}_{rollout_id}': wandb.Video(video, fps=50)}, step=i)
+                # video = np.stack(tr['images']).transpose(0, 3, 1, 2)
+                # wandb_logger.log({f'eval_video/task{tid}_{rollout_id}': wandb.Video(video, fps=50)}, step=i)
                 rollout_id += 1
 
         if len(tasks) > 1:
@@ -756,7 +756,8 @@ def _perform_control_eval_vec(agent, tasks, i, variant, wandb_logger, agent_dp, 
 
 
 def make_multiple_value_reward_visulizations(agent, variant, i, replay_buffer, wandb_logger):
-    trajs = replay_buffer.get_random_trajs(3)
-    images = agent.make_value_reward_visulization(variant, trajs)
-    wandb_logger.log({'reward_value_images': wandb.Image(images)}, step=i)
+    # trajs = replay_buffer.get_random_trajs(3)
+    # images = agent.make_value_reward_visulization(variant, trajs)
+    # wandb_logger.log({'reward_value_images': wandb.Image(images)}, step=i)
+    pass
   

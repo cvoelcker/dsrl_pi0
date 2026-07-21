@@ -1,8 +1,5 @@
 import os
-# Stop JAX from preallocating ~90% of VRAM at first CUDA touch, so the N
-# SubprocVectorizedLiberoEnv workers' EGL/MuJoCo rendering contexts (and
-# cuSolver's handle) still have headroom on the same GPU. Must be set BEFORE
-# anything imports jax.
+# Stop JAX from preallocating ~90% of VRAM
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import argparse
@@ -42,7 +39,7 @@ if __name__ == '__main__':
     parser.add_argument('--use_policy_reps', default=1, help='Condition the critic/actor on the base pi0 model features (policy representation).', type=int)
     parser.add_argument('--critic_rep', default='psi', help="Which base pi0 representation to read: 'psi' (state-only prefix mean).", type=str)
     # --- Subprocess-vectorized Libero env (env.subproc_libero_env) ---
-    parser.add_argument('--num_envs', default=4, help='Number of parallel Libero env workers (SubprocVectorizedLiberoEnv).', type=int)
+    parser.add_argument('--num_envs', default=16, help='Number of parallel Libero env workers (SubprocVectorizedLiberoEnv).', type=int)
     parser.add_argument('--num_steps_wait', default=10, help='Warmup dummy steps after reset (settle sim before recording obs).', type=int)
     parser.add_argument('--env_resolution', default=256, help='Camera height/width for Libero rendering.', type=int)
     parser.add_argument('--reset_mode', default='', help="'random' (per-episode object placement seed) or 'curated_uniform' (draw from official init states). Empty => derived from --random_reset.", type=str)
